@@ -10,26 +10,11 @@ from fontTools.misc.cython import returns
 
 rng = np.random.default_rng(42)
 
-class BayesianAgent:
-    def __init__(self,
-                 prior_mean,
-                 prior_var,
-                 obs_var_social,
-                 obs_var_computer,
-                 c0, c1, c2, c3):
+class Agent:
+    def __init__(self):
         # Beliefs about willingness to accept
-        self.prior_mean = prior_mean
-        self.prior_var = prior_var
-        self.post_mean = prior_mean
-        self.post_var = prior_var
-
-        # assumptions about variance in social and computer samples
-        self.obs_var_social = obs_var_social
-        self.obs_var_computer = obs_var_computer
-
         # utility cost
         self.c0 = c0  # cost per dollar offered
-        self.c1 = c1  # cost per total sample
         self.c2 = c2  # extra cost per computer sample
         self.c3 = c3  # reward if accepted
 
@@ -55,46 +40,6 @@ class BayesianAgent:
     def take_computer_sample(self, price):
         self.computer_prices.append(price)
 
-    def update_posterior(self, mode="combined"):
-        # start from the prior every time for clarity
-        mu = self.prior_mean
-        var = self.prior_var
-
-        if mode in ("combined", "social"):
-            if self.social_prices:
-                mu, var = normal_normal_posterior(
-                    prior_mean=mu,
-                    prior_var=var,
-                    samples=self.social_prices,
-                    obs_var=self.obs_var_social
-                )
-
-        if mode in ("combined", "computer"):
-            if self.computer_prices:
-                mu, var = normal_normal_posterior(
-                    prior_mean=mu,
-                    prior_var=var,
-                    samples=self.computer_prices,
-                    obs_var=self.obs_var_computer
-                )
-
-        self.post_mean = mu
-        self.post_var = var
-
-    def propose_price_from_computer(computer_sample, x0):
-        mean_price, se_mean = ols_regression(computer_sample, x0)
-
-        # Draw one candidate WTP from Normal(mean_price, se_mean)
-        offer = rng.normal(loc=mean_price, scale=se_mean if se_mean > 0 else 1.0)
-        return max(0.0, offer)  # ensure non-negative
-
-    def propose_price_from_social(social_sample):
-        mean_price, std_price = mean(social_sample)
-
-        # Draw one candidate WTP from Normal(mean_price, std_price)
-        offer = rng.normal(loc=mean_price, scale=std_price if std_price > 0 else 1.0)
-        return max(0.0, offer)
-
     # check either the computer or social dataset
     # come up with a price by regression or average
     # make an offer
@@ -104,24 +49,6 @@ class BayesianAgent:
     # ok so basically I want two prior distributions for my agent: one that only uses social samples
     # and one that only uses computer samples
     # I want my agent to have the opportunity to switch between samples
-
-def normal_normal_posterior(prior_mean, prior_var, samples, obs_var):
-    n = len(samples)
-    if n == 0:
-        return prior_mean, prior_var
-
-    sum_y = sum(samples)
-
-    precision_prior = 1.0 / prior_var # precision of distribution
-    precision_lik = n / obs_var # precision likelihood
-        # High variance implies low precision
-        # Low variance implies high precision
-
-    post_var = 1.0 / (precision_prior + precision_lik)
-    post_mean = post_var * (precision_prior * prior_mean + (sum_y / obs_var))
-
-    return post_mean, post_var
-
 
 
 def ols_regression(computer_sample, x_0):
@@ -144,25 +71,30 @@ def ols_regression(computer_sample, x_0):
 
 
 def mean(social_sample):
-    mean_database = []
-    mean_int = 0
-    for social_samp in social_sample:
-        mean_database.append(social_samp[3])
-    for item in mean_database:
-        mean_int = mean_int + item
-    mean_int = mean_int/len(social_sample)
-    mse = 0
-    for item in mean_database:
-        mse = mse + ((item - mean_int)**2)
-    standard_error = math.sqrt(mse)
-    return mean_int, standard_error
+    # Extract prices
+    prices = [row[3] for row in social_sample]
+    n = len(prices)
 
-def utility_function(c0, c1, c2, c3, offer_price, clerk_wtta,number_of_total_samples, number_of_computer_samples):
+    # Sample mean
+    mean_int = sum(prices) / n
+
+    # Sample variance (unbiased estimator)
+    var = sum((p - mean_int)**2 for p in prices) / (n - 1)
+
+    # Sample standard deviation
+    std = math.sqrt(var)
+
+    # Standard Error of the Mean (SEM)
+    sem = std / math.sqrt(n)
+
+    return mean_int, sem
+
+def utility_function(c0, c2, c3, offer_price, clerk_wtta, number_of_computer_samples):
     if offer_price >= clerk_wtta:
         acceptance = 1
     else:
         acceptance = 0
-    utility = - c0*offer_price - c1*number_of_total_samples - c2*number_of_computer_samples + c3*acceptance
+    utility = - c0*offer_price - c2*number_of_computer_samples + c3*acceptance
     return utility
 
 def clerk_acceptance_price(laptop_wanted):
@@ -205,62 +137,135 @@ def computer_sampling(computer_optionz,x_0):
             computer_samples.append(computer)
     return computer_samples
 
-# have an outlier treatment condition maybe for the agent
-if __name__ == "__main__":
-    #computer_options = setup_computers()
-    #x0 = (2,4,128) # the laptop that you are looking to purchase (want to find optimal price)
-    #clerk_wta = clerk_acceptance_price(x0)
-    #social_samples = social_sampling(computer_options,x0)
-    #computer_samples = computer_sampling(computer_options, x0)
-    x0 = (2, 4, 128)  # laptop the agent wants
+from scipy.stats import norm
 
-    # True (hidden) clerk WTA for this run
+def compute_o(alpha, sigma_tau, gamma, mu_tau, fallback_o=0.0, verbose=True):
+    k = (alpha * sigma_tau * np.sqrt(2 * np.pi)) / gamma
+
+    # e^{-z^2/2} must be in (0, 1], so k must be in (0,1]
+    if k <= 0 or k > 1:
+        if verbose:
+            print(
+                f"[compute_o] No interior optimum for "
+                f"alpha={alpha}, sigma_tau={sigma_tau}, gamma={gamma}. "
+                f"k={k:.4f} not in (0, 1]. Returning fallback o={fallback_o}."
+            )
+        return fallback_o
+
+    root_term = -2 * np.log(k)  # >= 0 in the valid range
+    z = np.sqrt(root_term)      # + root
+    o = mu_tau + sigma_tau * z
+    return o
+
+def one_round(x0, c0, c2, c3,):
     clerk_wta = clerk_acceptance_price(x0)
 
-    # 2. Get candidate pools
     social_samples = social_sampling(setup_computers(), x0)
     computer_samples = computer_sampling(setup_computers(), x0)
-
-    print(ols_regression(computer_samples,x0))
-
-    # 3. Cost parameters for utility
-    c0 = 1.0  # cost per dollar in offer
-    c1 = 0.1  # cost per total sample
-    c2 = 0.1  # extra cost per computer sample
-    c3 = 500.0  # reward if deal accepted
 
     n_total_social = len(social_samples)
     n_total_computer = len(computer_samples)
 
-    # 4. Agent proposes offers from each method
-    offer_social = BayesianAgent.propose_price_from_social(social_samples)
-    offer_computer = BayesianAgent.propose_price_from_computer(computer_samples, x0)
+    social_mu, social_sigma = mean(social_samples)
+    computer_mu, computer_sigma = ols_regression(computer_samples,x0)
+    print('social mean:', social_mu)
+    print('computer mean:', computer_mu)
+    print('social standard deviation:', social_sigma)
+    print('computer standard deviation:', computer_sigma)
 
-    # 5. Compute utilities for each method
+    offering_price_social = compute_o(c0, social_sigma, c3, social_mu)
+    offering_price_computer = compute_o(c0, computer_sigma, c3, computer_mu)
+
     u_social = utility_function(
-        c0, c1, c2, c3,
-        offer_price=offer_social,
+        c0, c2, c3,
+        offer_price=offering_price_social,
         clerk_wtta=clerk_wta,
-        number_of_total_samples=n_total_social,
         number_of_computer_samples=0  # using only social in this scenario
     )
 
     u_computer = utility_function(
-        c0, c1, c2, c3,
-        offer_price=offer_computer,
+        c0, c2, c3,
+        offer_price=offering_price_computer,
         clerk_wtta=clerk_wta,
-        number_of_total_samples=n_total_computer,
         number_of_computer_samples=n_total_computer  # all samples are computer-based
     )
 
-    print(f"Clerk WTA (hidden): {clerk_wta:.2f}")
-    print(f"Offer (social):     {offer_social:.2f}, utility: {u_social:.2f}")
-    print(f"Offer (computer):   {offer_computer:.2f}, utility: {u_computer:.2f}")
+    #print(f"Clerk WTA (hidden): {clerk_wta:.2f}")
+    #print(f"Offer (social):     {offering_price_social:.2f}, utility: {u_social:.2f}")
+    #print(f"Offer (computer):   {offering_price_computer:.2f}, utility: {u_computer:.2f}")
 
-    # so i was able to do one round but cannot do mutliple roudns not too sure how to impletmenet this
     if u_social > u_computer:
         chosen_method = "social"
     else:
         chosen_method = "computer"
 
     print("Method with higher utility this round:", chosen_method)
+
+    return chosen_method
+# have an outlier treatment condition maybe for the agent
+if __name__ == "__main__":
+    x0 = (2, 4, 128)
+    # c0 = 1.0
+    # cost per dollar in offer c1 = 0.1
+    # cost per total sample c2 = 0.1
+    # extra cost per computer sample c3 = 500.0
+    # reward if deal accepted
+    total_social_accepted_c0 = 0
+    total_computer_accepted_c0 = 0
+    prev_c0 = ""
+    total_social_accepted_c2 = 0
+    total_computer_accepted_c2 = 0
+    prev_c2 = ""
+    total_social_accepted_c3 = 0
+    total_computer_accepted_c3 = 0
+    prev_c3 = ""
+
+    for c0 in range(1, 21, 1):
+        method = one_round(x0, c0, 1,50.0)
+        if prev_c0 == "":
+            prev_c0 = method
+        elif prev_c0 != method:
+            print("Method changed at c0 = ", c0)
+            prev_c0 = method
+        if method == "social":
+            total_social_accepted_c0 = total_social_accepted_c0 + 1
+        else:
+            total_computer_accepted_c0 = total_computer_accepted_c0 + 1
+    print("=========================================================")
+    for c2 in range(1, 21, 10):
+        method = one_round(x0, 1, c2,50.0)
+        if prev_c2 == "":
+            prev_c2 = method
+        elif prev_c2 != method:
+            print("Method changed at c0 = ", c2)
+            prev_c2 = method
+        if method == "social":
+            total_social_accepted_c2 = total_social_accepted_c2 + 1
+        else:
+            total_computer_accepted_c2 = total_computer_accepted_c2 + 1
+    print("=========================================================")
+
+    for c3 in range(50, 201, 10):
+        method = one_round(x0, 1, 1,c3)
+        if prev_c3 == "":
+            prev_c3 = method
+        elif prev_c3 != method:
+            print("Method changed at c3 = ", c3)
+            prev_c3 = method
+        if method == "social":
+            total_social_accepted_c3 = total_social_accepted_c3 + 1
+        else:
+            total_computer_accepted_c3 = total_computer_accepted_c3 + 1
+
+
+'''
+social mean: 978.0483494449371
+computer mean: 967.5676357225287
+social standard deviation: 23.397382708972597
+computer standard deviation: 22.80101731816566
+Clerk WTA (hidden): 1011.69
+Offer (social):     1026.49, utility: -526.49
+Offer (computer):   1015.06, utility: -536.06
+Method with higher utility this round: social
+
+'''
